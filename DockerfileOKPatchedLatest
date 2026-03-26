@@ -1,0 +1,67 @@
+# Step 1: Set up a build environment and clone protobuf from forked repo
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        curl ca-certificates gcc g++ python3 zip unzip git && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+RUN curl -fsSL -o /usr/local/bin/bazel \
+        "https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-${TARGETARCH}" && \
+    chmod +x /usr/local/bin/bazel
+
+WORKDIR /workspace
+
+# Pre-warm bazel binary download.
+RUN mkdir -p /tmp/warmup && \
+    touch /tmp/warmup/WORKSPACE /tmp/warmup/BUILD && \
+    cd /tmp/warmup && bazel version && \
+    rm -rf /tmp/warmup
+
+## Step 1.5: Build protoc from our modified version
+
+RUN git clone --branch php-protobuf-public-imports-fix --depth 1 \
+    https://github.com/alowde/protobuf.git /workspace
+
+RUN bazel build //:protoc && \
+    cp bazel-bin/protoc /usr/local/bin/protoc-patched && \
+    chmod +x /usr/local/bin/protoc-patched
+
+# Step 2: PHP environment following tforesti's original reproducer but with patched protoc
+# See https://github.com/tforesti/php-protobuf-ext-issue referenced in https://github.com/protocolbuffers/protobuf/issues/11146
+
+# Unpinned php image as per original
+FROM php AS runtime
+WORKDIR /app
+
+RUN mv /usr/local/etc/php/php.ini-development /usr/local/etc/php/php.ini
+
+RUN apt update
+RUN apt install -y protobuf-compiler
+RUN apt install -y python3
+RUN apt install -y libzip-dev
+
+COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/bin/
+RUN install-php-extensions zip
+RUN install-php-extensions grpc
+RUN install-php-extensions protobuf
+
+# Bring in our patched protoc, and the usual standard types from the builder stage.
+COPY --from=builder /usr/local/bin/protoc-patched /usr/local/bin/protoc
+COPY --from=builder /workspace/src/google/protobuf/*.proto /usr/local/include/google/protobuf/
+
+COPY --from=composer /usr/bin/composer /usr/bin/
+
+COPY . /app
+
+# PHP protbuf class generation
+RUN protoc --proto_path=src --php_out=build $(find src -name '*.proto')
+# composer.json and autoload generation
+RUN python3 package.py
+RUN composer install
+RUN composer check-platform-reqs
+
+ENTRYPOINT php index.php
